@@ -45,7 +45,7 @@ class Config:
     width: int = 512
     steps: int = 512
     train_sequences: int = 256
-    batch_size: int = 8
+    batch_size: int = 16
     epochs: int = 15
     lr: float = 3e-4
     d_model: int = 1024
@@ -105,10 +105,12 @@ def make_dataset(cfg: Config) -> tuple[torch.Tensor, torch.Tensor]:
 def train_model(model: nn.Module, x: torch.Tensor, y: torch.Tensor, cfg: Config, device: torch.device) -> None:
     model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
-    x = x.to(device)
-    y = y.to(device)
     n = x.size(0)
-    indices = torch.arange(n, device=device)
+    indices = torch.arange(n)
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    use_scaler = amp_dtype == torch.float16
+    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
+    print(f"mixed precision: {amp_dtype} (scaler={use_scaler})")
     for epoch in range(1, cfg.epochs + 1):
         indices = indices[torch.randperm(n)]
         total_loss = 0.0
@@ -116,13 +118,19 @@ def train_model(model: nn.Module, x: torch.Tensor, y: torch.Tensor, cfg: Config,
         total_bits = 0
         for i in range(0, n, cfg.batch_size):
             batch_idx = indices[i : i + cfg.batch_size]
-            xb = x[batch_idx]
-            yb = y[batch_idx]
-            logits = model(xb)
-            loss = F.cross_entropy(logits.view(-1, 2), yb.view(-1))
+            xb = x[batch_idx].to(device, non_blocking=True)
+            yb = y[batch_idx].to(device, non_blocking=True)
+            with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                logits = model(xb)
+                loss = F.cross_entropy(logits.view(-1, 2), yb.view(-1))
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
+            if use_scaler:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
             total_loss += loss.item() * xb.size(0)
             pred = logits.argmax(dim=-1)
             total_correct += (pred == yb).sum().item()
@@ -136,10 +144,12 @@ def train_model(model: nn.Module, x: torch.Tensor, y: torch.Tensor, cfg: Config,
 @torch.no_grad()
 def rollout_model(model: nn.Module, initial: torch.Tensor, steps: int, device: torch.device) -> torch.Tensor:
     model.eval()
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     cur = initial.clone().to(device).unsqueeze(0)  # [1, W]
     out = [cur.squeeze(0).cpu()]
     for _ in range(steps - 1):
-        logits = model(cur)
+        with torch.autocast(device_type="cuda", dtype=amp_dtype):
+            logits = model(cur)
         cur = logits.argmax(dim=-1)  # [1, W]
         out.append(cur.squeeze(0).cpu())
     return torch.stack(out, dim=0)
